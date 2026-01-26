@@ -1,5 +1,6 @@
-import logging
 import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+import logging
 import sys
 
 def get_logger(name, save_dir=None):

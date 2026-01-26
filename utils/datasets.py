@@ -1,5 +1,6 @@
 # utils/datasets.py
 import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import glob
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader

@@ -1,7 +1,8 @@
 # test.py (最终完善版)
+import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import torch
 import numpy as np
-import os
 from config import cfg
 from models import GenMambaINN
 from utils.datasets import get_dataloader

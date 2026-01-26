@@ -1,6 +1,7 @@
 # config.py
-import torch
 import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+import torch
 
 class Config:
     # --- 基础配置 ---
@@ -34,8 +35,8 @@ class Config:
     
     # --- 训练参数 ---
     IMAGE_SIZE = 256
-    BATCH_SIZE = 8
-    NUM_WORKERS = 4
+    BATCH_SIZE = 16
+    NUM_WORKERS = 8
     LR = 1e-4
     
     # --- 模型参数 ---

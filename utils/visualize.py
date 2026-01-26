@@ -1,5 +1,6 @@
 # utils/visualize.py
 import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import re
 import torch
 import numpy as np

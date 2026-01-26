@@ -1,8 +1,10 @@
 # train.py
 import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import torch
 import torch.optim as optim
 from diffusers import AutoencoderKL
+from tqdm import tqdm
 
 from config import cfg
 from models import GenMambaINN
@@ -46,7 +48,7 @@ def train():
     vae = load_vae(device)
     model = GenMambaINN(cfg).to(device)
     
-    # 优化器: 包含所有参数 (PyTorch 会自动忽略 requires_grad=False 的参数)
+    # 优化器
     optimizer = optim.AdamW(model.parameters(), lr=cfg.LR)
     
     # 数据加载
@@ -66,43 +68,43 @@ def train():
         current_epoch = epoch + 1
         model.train()
         
-        # === 动态阶段调度 (Stage Scheduling) ===
+        # === 动态阶段调度 ===
         if current_epoch <= stage1_end:
             stage = "Stage 1 (INN Warm-up)"
-            # 策略: 训练 INN，冻结 Rectifier，无噪声
-            set_freeze(model.inn_blocks, False) # Train INN
-            set_freeze(model.rectifier, True)   # Freeze Rect
-            
-            # Loss权重: 只关注隐写和恢复，不管矫正
+            short_stage = "S1-INN"
+            set_freeze(model.inn_blocks, False) 
+            set_freeze(model.rectifier, True)   
             w_sec, w_stego, w_rect = cfg.LAMBDA_SECRET, cfg.LAMBDA_STEGO, 0.0
-            noise_std = 0.0 # 理想环境
+            noise_std = 0.0 
             
         elif current_epoch <= stage2_end:
             stage = "Stage 2 (Rectifier Training)"
-            # 策略: 冻结 INN，训练 Rectifier，加噪声
-            set_freeze(model.inn_blocks, True)  # Freeze INN (保持隐写分布不变)
-            set_freeze(model.rectifier, False)  # Train Rect
-            
-            # Loss权重: 只关注矫正效果 (Denoising)
-            # 虽然 L_sec 也能算，但 Stage 2 核心是修补潜码，L_rect 是最直接的监督信号
+            short_stage = "S2-Rect"
+            set_freeze(model.inn_blocks, True)  
+            set_freeze(model.rectifier, False)  
             w_sec, w_stego, w_rect = 0.0, 0.0, cfg.LAMBDA_RECT
-            noise_std = 0.1 # 模拟攻击环境
+            noise_std = 0.1 
             
         else:
             stage = "Stage 3 (Joint Fine-tuning)"
-            # 策略: 全部解冻，加噪声，全Loss
+            short_stage = "S3-Joint"
             set_freeze(model.inn_blocks, False)
             set_freeze(model.rectifier, False)
-            
             w_sec, w_stego, w_rect = cfg.LAMBDA_SECRET, cfg.LAMBDA_STEGO, cfg.LAMBDA_RECT
             noise_std = 0.1
             
-        # 在每个 Epoch 开始时打印当前策略
-        if global_step % len(train_loader) == 0:
-            logger.info(f"\n>>> 进入 {stage} | Noise: {noise_std} | Weights: Sec={w_sec} Stego={w_stego} Rect={w_rect}")
+        # 移除了此处 "进入 Stage" 的频繁打印，保持日志整洁
+
+        # === 初始化 Epoch 统计变量 ===
+        epoch_loss_all = 0.0
+        epoch_loss_sec = 0.0
+        epoch_loss_rect = 0.0
+        num_batches = 0
 
         # === Batch 循环 ===
-        for step, (images, _) in enumerate(train_loader):
+        pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Ep {current_epoch} | {short_stage}", unit="batch")
+
+        for step, (images, _) in pbar:
             images = images.to(device)
             if images.shape[0] < 2: continue
             
@@ -114,18 +116,16 @@ def train():
             cover = images_to_latents(vae, cover_img)
             secret = images_to_latents(vae, secret_img)
             
-            # 2. 嵌入 (Forward)
-            # Stage 2 时 INN 被冻结，此处相当于 Inference 模式，产生固定的 stego 分布
+            # 2. 嵌入
             stego_latent = model.embed(cover, secret)
             
             # 3. 模拟攻击
             if noise_std > 0:
                 stego_damaged = simulate_vae_attack(stego_latent, noise_std=noise_std)
             else:
-                stego_damaged = stego_latent # Stage 1 也就是无损
+                stego_damaged = stego_latent 
             
             # 4. 提取与矫正
-            # Stage 1 时 Rectifier 被冻结(或初始化状态)，不起作用
             recovered_all, z_rectified = model.extract(stego_damaged)
             _, rec_secret = recovered_all.chunk(2, dim=1)
             
@@ -134,7 +134,6 @@ def train():
             loss_stego = torch.mean((stego_latent[:, :4] - cover) ** 2)
             loss_rect = torch.mean((z_rectified - stego_latent) ** 2)
             
-            # 按照阶段权重组合
             total_loss = (w_sec * loss_secret + 
                           w_stego * loss_stego + 
                           w_rect * loss_rect)
@@ -146,21 +145,38 @@ def train():
             
             global_step += 1
             
-            if global_step % 20 == 0:
-                logger.info(f"Ep[{current_epoch}] {stage[:7]} | "
-                            f"L_all:{total_loss:.4f} "
-                            f"L_sec:{loss_secret:.4f} "
-                            f"L_rect:{loss_rect:.4f}")
+            # === 累加 Loss (使用 .item() 避免显存泄漏) ===
+            epoch_loss_all += total_loss.item()
+            epoch_loss_sec += loss_secret.item()
+            epoch_loss_rect += loss_rect.item()
+            num_batches += 1
 
-        # 保存阶段性模型
+            # 进度条实时显示 (可选，方便看一眼是不是跑飞了)
+            pbar.set_postfix({
+                'L': f"{total_loss.item():.4f}", 
+                'Stg': short_stage
+            })
+            
+            # --- 移除了原来的 global_step % 50 打印 ---
+
+        # === Epoch 结束: 打印平均 Loss ===
+        avg_loss_all = epoch_loss_all / num_batches
+        avg_loss_sec = epoch_loss_sec / num_batches
+        avg_loss_rect = epoch_loss_rect / num_batches
+
+        logger.info(f"End Ep[{current_epoch}] {stage} | "
+                    f"Avg Loss: {avg_loss_all:.5f} | "
+                    f"Sec: {avg_loss_sec:.5f} | "
+                    f"Rect: {avg_loss_rect:.5f}")
+
+        # === 保存策略: 仅在阶段结束时保存 ===
         if current_epoch in [stage1_end, stage2_end, cfg.EPOCHS]:
-            save_name = f"model_{stage.split(' ')[2].replace('(', '').replace(')', '')}.pth"
-            torch.save(model.state_dict(), f"{cfg.CHECKPOINT_DIR}/{save_name}")
-            logger.info(f"阶段完成，模型已保存: {save_name}")
+            save_name = f"model_{short_stage}.pth"
+            save_path = os.path.join(cfg.CHECKPOINT_DIR, save_name)
+            torch.save(model.state_dict(), save_path)
+            logger.info(f"✅ 阶段完成，Checkpoint 已保存: {save_name}")
         
-        # 定期保存
-        if current_epoch % 10 == 0:
-            torch.save(model.state_dict(), f"{cfg.CHECKPOINT_DIR}/epoch_{current_epoch}.pth")
+        # --- 移除了原来的 if current_epoch % 10 == 0 保存 ---
 
 if __name__ == "__main__":
     train()
