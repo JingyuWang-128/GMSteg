@@ -47,8 +47,8 @@ class Config:
     MAMBA_D_MODEL = 64
     
     # --- Loss 权重 (基准值) ---
-    LAMBDA_SECRET = 10.0
-    LAMBDA_STEGO = 1.0
+    LAMBDA_SECRET = 100.0
+    LAMBDA_STEGO = 0.1
     LAMBDA_RECT = 5.0
     
     # --- 结果保存 ---

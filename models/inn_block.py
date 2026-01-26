@@ -21,7 +21,6 @@ class LatentINNBlock(nn.Module):
         x1, x2 = x.chunk(2, dim=1)
         
         # 准备频率上下文
-        # 假设 x1 是控制通道，利用 x1 的纹理决定 x2 的嵌入强度
         freq_map = analyze_frequency_energy(x1)
         
         # 序列化供 Mamba 使用
@@ -35,6 +34,11 @@ class LatentINNBlock(nn.Module):
             s = s.view(B, H, W, -1).permute(0, 3, 1, 2)
             t = t.view(B, H, W, -1).permute(0, 3, 1, 2)
             
+            # =================================================
+            # 🔥 核心修复: Tanh Clamping (防爆炸) 🔥
+            # =================================================
+            s = 2.0 * torch.tanh(s)
+            
             y1 = x1
             y2 = x2 * torch.exp(s) + t
             return torch.cat([y1, y2], dim=1)
@@ -45,6 +49,9 @@ class LatentINNBlock(nn.Module):
             
             s = s.view(B, H, W, -1).permute(0, 3, 1, 2)
             t = t.view(B, H, W, -1).permute(0, 3, 1, 2)
+            
+            # 🔥 逆向时也要加同样的约束 🔥
+            s = 2.0 * torch.tanh(s)
             
             y1 = x1
             y2 = (x2 - t) * torch.exp(-s)

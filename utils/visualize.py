@@ -58,7 +58,7 @@ def plot_loss_curves(log_file, save_path="results/loss_curve.png"):
 def latents_to_rgb(vae, latents):
     """ 将潜码解码为 RGB 图片 (numpy uint8, 0-255) """
     # 1. 反缩放
-    latents = latents / 0.18215
+    # latents = latents / 0.18215
     
     # 2. VAE 解码
     with torch.no_grad():
