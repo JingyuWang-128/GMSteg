@@ -11,6 +11,8 @@ from .frequency import analyze_frequency_energy
 
 from .datasets import get_dataloader
 
+from .visualize import plot_loss_curves, visualize_generation
+
 # 定义包的公开接口
 __all__ = [
     'get_logger',

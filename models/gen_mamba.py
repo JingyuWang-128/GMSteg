@@ -1,3 +1,4 @@
+import torch  # <--- 新增这行，修复 NameError
 import torch.nn as nn
 from .inn_block import LatentINNBlock
 from .rectifier import DriftRectifier
