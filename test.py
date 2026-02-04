@@ -64,7 +64,7 @@ def run_full_test():
     
     # 加载最新权重
     # 优先加载指定 Epoch，如果不存在则加载 latest
-    ckpt_path = f"{cfg.CHECKPOINT_DIR}/epoch_{cfg.EPOCHS}.pth"
+    ckpt_path = f"{cfg.CHECKPOINT_DIR}/model_stage_{cfg.EPOCHS}.pth"
     if not os.path.exists(ckpt_path):
         ckpt_path = f"{cfg.CHECKPOINT_DIR}/gen_mamba_latest.pth"
         

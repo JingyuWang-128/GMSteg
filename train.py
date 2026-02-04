@@ -30,9 +30,8 @@ def load_vae(device):
 def images_to_latents(vae, images):
     with torch.no_grad():
         dist = vae.encode(images).latent_dist
-        # 【关键】训练时移除缩放因子，让数值范围变大，避免梯度消失
-        # latents = dist.sample() * cfg.VAE_SCALE_FACTOR 
-        latents = dist.sample()
+        # 【关键修复】恢复缩放因子，防止数值过大导致梯度爆炸/NaN
+        latents = dist.sample() * cfg.VAE_SCALE_FACTOR 
     return latents
 
 def train():
@@ -42,7 +41,13 @@ def train():
     
     vae = load_vae(device)
     model = GenMambaINN(cfg).to(device)
+    
+    # 1. 定义优化器
     optimizer = optim.AdamW(model.parameters(), lr=cfg.LR)
+    
+    # 2. 【新增】定义学习率调度器 (Cosine Annealing)
+    # 适应 500 轮的长训练，防止后期震荡，并保持微小梯度 (eta_min)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS, eta_min=1e-6)
     
     train_loader = get_dataloader(cfg.DIV2K_TRAIN_PATH, cfg.IMAGE_SIZE, cfg.BATCH_SIZE, is_train=True)
     if train_loader is None: return
@@ -102,11 +107,15 @@ def train():
             
             loss_secret = torch.mean((rec_secret - secret) ** 2)
             loss_stego = torch.mean((stego_latent[:, :4] - cover) ** 2)
-            loss_rect = torch.mean((z_rectified - stego_latent) ** 2)
+            
+            # 安全计算 loss_rect，防止 0 * Inf = NaN
+            if w_rect > 0:
+                loss_rect = torch.mean((z_rectified - stego_latent) ** 2)
+            else:
+                loss_rect = torch.tensor(0.0, device=device)
             
             total_loss = (w_sec * loss_secret + w_stego * loss_stego + w_rect * loss_rect)
             
-            # 监控指标
             with torch.no_grad():
                 abs_diff = torch.mean(torch.abs(stego_latent[:, :4] - cover))
 
@@ -115,7 +124,6 @@ def train():
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             
-            # 累加
             epoch_stats['all'] += total_loss.item()
             epoch_stats['sec'] += loss_secret.item()
             epoch_stats['stg'] += loss_stego.item()
@@ -124,11 +132,14 @@ def train():
             num_batches += 1
 
             pbar.set_postfix({'L': f"{total_loss.item():.4f}", 'Diff': f"{abs_diff.item():.4f}"})
+        
+        # 【新增】每个 Epoch 结束后更新学习率
+        scheduler.step()
 
         # 打印日志
         if num_batches > 0:
             avgs = {k: v / num_batches for k, v in epoch_stats.items()}
-            logger.info(f"End Ep[{current_epoch}] {stage} | "
+            logger.info(f"End Ep[{current_epoch}] {stage} | LR: {optimizer.param_groups[0]['lr']:.2e} | "
                         f"All: {avgs['all']:.5f} | "
                         f"Sec: {avgs['sec']:.5f} | "
                         f"Stg: {avgs['stg']:.5f} | "

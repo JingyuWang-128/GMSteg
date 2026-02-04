@@ -113,7 +113,7 @@ def visualize_generation(model, vae, dataloader, device, save_path="results/visu
         # --- 步骤 D: 解码回 RGB ---
         vis_cover = latents_to_rgb(vae, z_cover)      # 原始载体
         vis_secret = latents_to_rgb(vae, z_secret)    # 原始秘密
-        vis_stego = latents_to_rgb(vae, z_stego)      # 隐写后的图
+        vis_stego = latents_to_rgb(vae, z_stego[:, :4])      # 隐写后的图
         vis_rec = latents_to_rgb(vae, z_rec_secret)   # 恢复的秘密
         
         # --- 步骤 E: 计算残差 (Stego - Cover) ---
