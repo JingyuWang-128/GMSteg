@@ -1,95 +1,62 @@
 import torch
-import random
+import torch.nn.functional as F
+import numpy as np
 
-def simulate_vae_attack(latent, vae=None, noise_std=0.1):
+def attack_in_rgb(image_tensor, attack_type='random'):
     """
-    模拟真实的 VAE 回环攻击 (Latent -> Image -> Attack -> Latent)
-    
-    Args:
-        latent: [B, C, H, W] 潜码
-        vae: AutoencoderKL 模型实例 (如果为 None，则降级为简单的潜空间加噪)
-        noise_std: 攻击强度 (RGB 域或 Latent 域的标准差)
+    在 RGB 像素域进行攻击模拟
+    输入: image_tensor [B, 3, H, W], 范围 [-1, 1]
+    输出: attacked_tensor [B, 3, H, W], 范围 [-1, 1]
     """
-    # 模式 A: 快速模拟 (仅潜空间加噪)
-    if vae is None:
-        noise = torch.randn_like(latent) * noise_std
-        return latent + noise
+    # 1. 转为 [0, 1] 方便处理
+    img = (image_tensor + 1) / 2.0
     
-    # 模式 B: 真实回环攻击 (Real VAE Round-trip)
-    # 这能捕捉到 VAE 重构带来的结构性漂移，完美契合 LDR 创新点
+    # 2. 选择攻击模式
+    if attack_type == 'random':
+        # 概率分布: 噪声(30%), 裁切(20%), 遮挡(20%), 模糊(20%), JPEG模拟(10%)
+        attack_type = np.random.choice(
+            ['noise', 'crop', 'dropout', 'blur', 'jpeg'], 
+            p=[0.3, 0.2, 0.2, 0.2, 0.1]
+        )
     
-    # 1. 解码 (Decode): Latent -> Image (RGB)
-    with torch.no_grad():
-        # 注意：根据您的 train.py，latents 未缩放，直接解码即可
-        # VAE decode 输出范围通常是 [-1, 1]
-        decoded_images = vae.decode(latent).sample
+    # --- 攻击实现 ---
+    if attack_type == 'noise':
+        # 高斯噪声
+        noise = torch.randn_like(img) * 0.05
+        img = torch.clamp(img + noise, 0, 1)
         
-    # 2. 图像域攻击 (Image Domain Attack)
-    # 模拟信道噪声 (Gaussian Noise on Pixels)
-    if noise_std > 0:
-        noise_rgb = torch.randn_like(decoded_images) * noise_std
-        attacked_images = decoded_images + noise_rgb
-        # 必须截断回有效像素范围 [-1, 1]，模拟真实的图像存储限制
-        attacked_images = torch.clamp(attacked_images, -1.0, 1.0)
-    else:
-        attacked_images = decoded_images
-
-    # 3. 再编码 (Re-encode): Image (Attacked) -> Latent'
-    with torch.no_grad():
-        dist = vae.encode(attacked_images).latent_dist
-        damaged_latent = dist.sample()
+    elif attack_type == 'crop':
+        # 随机边缘裁切 (模拟截图不全)
+        B, C, H, W = img.shape
+        ratio = np.random.uniform(0.1, 0.25) # 裁掉 10%-25%
+        h_cut = int(H * ratio)
+        w_cut = int(W * ratio)
+        mask = torch.zeros_like(img)
+        # 保留中心区域
+        mask[:, :, h_cut:H-h_cut, w_cut:W-w_cut] = 1.0
+        img = img * mask
         
-    return damaged_latent
-
-def simulate_dropout_attack(latent, vae=None, drop_prob=0.3):
-    """
-    模拟真实的图像遮挡/裁剪攻击 (Latent -> Image -> Occlusion -> Latent)
-    
-    Args:
-        latent: [B, C, H, W] 潜码
-        vae: AutoencoderKL 模型
-        drop_prob: 遮挡面积占总面积的比例 (近似值)
-    """
-    # 模式 A: 仅潜空间随机丢弃 (Fallback, 模拟信道丢包)
-    if vae is None:
-        mask = torch.bernoulli(torch.ones_like(latent) * (1 - drop_prob))
-        return latent * mask
-
-    # 模式 B: 真实图像域遮挡 (Real Image Occlusion)
-    # 1. 解码 (Decode)
-    with torch.no_grad():
-        images = vae.decode(latent).sample
-        # images range: [-1, 1] (通常)
-
-    # 2. 图像域遮挡 (Apply Occlusion/Cutout on RGB Images)
-    B, C, H, W = images.shape
-    device = images.device
-    
-    # 创建一个遮挡掩码 (1=保留, 0=遮挡)
-    mask = torch.ones((B, 1, H, W), device=device)
-    
-    for i in range(B):
-        # 随机生成遮挡块的大小
-        # 假设遮挡一个矩形区域，面积约为 drop_prob
-        cut_w = int(W * (drop_prob ** 0.5)) 
-        cut_h = int(H * (drop_prob ** 0.5))
-        
-        # 随机位置
-        if cut_w < W and cut_h < H:
-            x = random.randint(0, W - cut_w)
-            y = random.randint(0, H - cut_h)
+    elif attack_type == 'dropout':
+        # 随机遮挡块 (Coarse Dropout)
+        B, C, H, W = img.shape
+        for i in range(B):
+            # 随机遮挡 32x32 的块
+            h_start = np.random.randint(0, H-32)
+            w_start = np.random.randint(0, W-32)
+            img[i, :, h_start:h_start+32, w_start:w_start+32] = 0.0
             
-            # 将该区域置为 0 (黑色遮挡)
-            mask[i, :, y:y+cut_h, x:x+cut_w] = 0.0
-            
-    # 应用遮挡 (模拟黑色块遮挡，如果是裁剪可以将背景设为其他颜色)
-    # 这里用 -1 (黑色/深色, 取决于归一化) 填充，或者直接乘 0 变灰
-    # 为了模拟信息彻底丢失，我们让像素值变成 -1 (接近纯黑) 或者 保持原值 * 0
-    attacked_images = images * mask + (1 - mask) * -1.0 
-
-    # 3. 再编码 (Re-encode)
-    with torch.no_grad():
-        dist = vae.encode(attacked_images).latent_dist
-        damaged_latent = dist.sample()
+    elif attack_type == 'blur':
+        # 平均模糊
+        img = F.avg_pool2d(img, kernel_size=3, stride=1, padding=1)
         
-    return damaged_latent
+    elif attack_type == 'jpeg':
+        # 模拟量化噪声 (Rounding)
+        steps = 32.0 
+        img = torch.round(img * steps) / steps
+
+    # 3. 转回 [-1, 1]
+    return torch.clamp(img * 2.0 - 1.0, -1, 1)
+
+# 保留旧的 latent 攻击函数以防兼容性问题，但主要用上面的
+def simulate_vae_attack(latent, noise_std=0.1):
+    return latent + torch.randn_like(latent) * noise_std

@@ -8,9 +8,8 @@ from tqdm import tqdm
 from config import cfg
 from models import GenMambaINN
 from utils.logger import get_logger
-# [修改] 导入更新后的两种攻击函数
-from utils.attacks import simulate_vae_attack, simulate_dropout_attack
 from utils.datasets import get_dataloader
+from utils.attacks import attack_in_rgb
 
 def set_freeze(model, frozen: bool):
     for param in model.parameters():
@@ -31,9 +30,8 @@ def load_vae(device):
 def images_to_latents(vae, images):
     with torch.no_grad():
         dist = vae.encode(images).latent_dist
-        # 【关键】训练时移除缩放因子，让数值范围变大，避免梯度消失
-        # latents = dist.sample() * cfg.VAE_SCALE_FACTOR 
-        latents = dist.sample()
+        # 【关键】移除缩放因子，让 Latent 数值范围更大，梯度更明显
+        latents = dist.sample() # 范围约 -4 ~ 4
     return latents
 
 def train():
@@ -48,7 +46,7 @@ def train():
     train_loader = get_dataloader(cfg.DIV2K_TRAIN_PATH, cfg.IMAGE_SIZE, cfg.BATCH_SIZE, is_train=True)
     if train_loader is None: return
 
-    logger.info(f"开始训练 (Total Epochs: {cfg.EPOCHS})")
+    logger.info(f"开始分阶段训练 (Total Epochs: {cfg.EPOCHS})")
     
     stage1_end = cfg.EPOCHS_STAGE1
     stage2_end = cfg.EPOCHS_STAGE1 + cfg.EPOCHS_STAGE2
@@ -57,27 +55,26 @@ def train():
         current_epoch = epoch + 1
         model.train()
         
-        # 阶段调度 (Curriculum Learning)
+        # 阶段调度
         if current_epoch <= stage1_end:
             stage = "Stage 1 (INN Warm-up)"
             set_freeze(model.inn_blocks, False) 
             set_freeze(model.rectifier, True)   
             w_sec, w_stego, w_rect = cfg.LAMBDA_SECRET, cfg.LAMBDA_STEGO, 0.0
-            noise_std = 0.0 
+            enable_attack = False
         elif current_epoch <= stage2_end:
             stage = "Stage 2 (Rect Training)"
             set_freeze(model.inn_blocks, True)  
             set_freeze(model.rectifier, False)  
             w_sec, w_stego, w_rect = 0.0, 0.0, cfg.LAMBDA_RECT
-            noise_std = 0.1 
+            enable_attack = True
         else:
             stage = "Stage 3 (Joint)"
             set_freeze(model.inn_blocks, False)
             set_freeze(model.rectifier, False)
             w_sec, w_stego, w_rect = cfg.LAMBDA_SECRET, cfg.LAMBDA_STEGO, cfg.LAMBDA_RECT
-            noise_std = 0.1
+            enable_attack = True
 
-        # 统计变量
         epoch_stats = {'all': 0.0, 'sec': 0.0, 'stg': 0.0, 'rect': 0.0, 'diff': 0.0}
         num_batches = 0
 
@@ -91,47 +88,46 @@ def train():
             cover = images_to_latents(vae, images[:split])
             secret = images_to_latents(vae, images[split : split*2])
             
+            # 1. 嵌入
             stego_latent = model.embed(cover, secret)
             
-            # =========================================================
-            # 🔥 真实攻击模拟 (Innovation 3: LDR Robustness) 🔥
-            # =========================================================
-            if noise_std > 0:
-                # 随机选择攻击模式以获得综合鲁棒性
-                # 50% 概率遇到信道噪声，50% 概率遇到局部遮挡/裁剪
-                if torch.rand(1).item() < 0.5:
-                    # 1. VAE 回环 + RGB 高斯噪声
-                    stego_damaged = simulate_vae_attack(stego_latent, vae=vae, noise_std=noise_std)
-                else:
-                    # 2. VAE 回环 + RGB 图像遮挡/裁剪
-                    # drop_prob=0.25 表示随机遮挡约 25% 的图像区域
-                    stego_damaged = simulate_dropout_attack(stego_latent, vae=vae, drop_prob=0.25)
+            # 2. 真实攻击模拟 (RGB 域)
+            if enable_attack:
+                with torch.no_grad():
+                    # Latent (大数值) -> 乘缩放 -> VAE Decode -> RGB
+                    latents_for_vae = stego_latent * cfg.VAE_SCALE_FACTOR
+                    stego_rgb = vae.decode(latents_for_vae).sample
+                    stego_rgb = torch.clamp(stego_rgb, -1, 1)
+                    
+                    # 像素域攻击
+                    attacked_rgb = attack_in_rgb(stego_rgb, attack_type='random')
+                    
+                    # RGB -> VAE Encode -> 除缩放(不需要，sample出来就是大数值) -> Latent
+                    dist = vae.encode(attacked_rgb).latent_dist
+                    stego_damaged = dist.sample()
             else:
-                # Stage 1: 无攻击，专注提升容量
-                stego_damaged = stego_latent 
-            # =========================================================
-            
-            # 提取阶段：先经过 Rectifier 修复，再 INN 提取
+                stego_damaged = stego_latent
+
+            # 3. 提取与矫正
             recovered_all, z_rectified = model.extract(stego_damaged)
             _, rec_secret = recovered_all.chunk(2, dim=1)
             
+            # 4. Loss
             loss_secret = torch.mean((rec_secret - secret) ** 2)
             loss_stego = torch.mean((stego_latent[:, :4] - cover) ** 2)
-            # Rect Loss 监督矫正后的潜码尽可能接近无损的 stego_latent
             loss_rect = torch.mean((z_rectified - stego_latent) ** 2)
-            
-            total_loss = (w_sec * loss_secret + w_stego * loss_stego + w_rect * loss_rect)
             
             # 监控指标
             with torch.no_grad():
                 abs_diff = torch.mean(torch.abs(stego_latent[:, :4] - cover))
 
+            total_loss = (w_sec * loss_secret + w_stego * loss_stego + w_rect * loss_rect)
+            
             optimizer.zero_grad()
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             
-            # 累加
             epoch_stats['all'] += total_loss.item()
             epoch_stats['sec'] += loss_secret.item()
             epoch_stats['stg'] += loss_stego.item()
@@ -141,7 +137,7 @@ def train():
 
             pbar.set_postfix({'L': f"{total_loss.item():.4f}", 'Diff': f"{abs_diff.item():.4f}"})
 
-        # 打印日志
+        # 日志
         if num_batches > 0:
             avgs = {k: v / num_batches for k, v in epoch_stats.items()}
             logger.info(f"End Ep[{current_epoch}] {stage} | "
