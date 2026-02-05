@@ -94,17 +94,27 @@ def train():
             # 2. 真实攻击模拟 (RGB 域)
             if enable_attack:
                 with torch.no_grad():
+                    # 【修复步骤1】切片：只取前4个通道（Stego图像部分）送入VAE
+                    stego_chunk = stego_latent[:, :4] 
+                    # 保留后4个通道（残差/丢失部分），用于后续拼接恢复维度
+                    residual_chunk = stego_latent[:, 4:] 
+
                     # Latent (大数值) -> 乘缩放 -> VAE Decode -> RGB
-                    latents_for_vae = stego_latent * cfg.VAE_SCALE_FACTOR
+                    # 注意：这里使用的是 stego_chunk (4通道)
+                    latents_for_vae = stego_chunk * cfg.VAE_SCALE_FACTOR
                     stego_rgb = vae.decode(latents_for_vae).sample
                     stego_rgb = torch.clamp(stego_rgb, -1, 1)
                     
                     # 像素域攻击
                     attacked_rgb = attack_in_rgb(stego_rgb, attack_type='random')
                     
-                    # RGB -> VAE Encode -> 除缩放(不需要，sample出来就是大数值) -> Latent
+                    # RGB -> VAE Encode -> 除缩放 -> Latent
                     dist = vae.encode(attacked_rgb).latent_dist
-                    stego_damaged = dist.sample()
+                    stego_damaged_chunk = dist.sample()
+                    
+                    # 【修复步骤2】拼接：将受攻击的4通道与原始的后4通道拼回，恢复为8通道
+                    # INN 的反向过程通常需要完整的通道数
+                    stego_damaged = torch.cat([stego_damaged_chunk, residual_chunk], dim=1)
             else:
                 stego_damaged = stego_latent
 

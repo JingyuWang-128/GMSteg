@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 # 导入修改后的通用 Mamba 层构建函数
-from .mamba_block import MambaLayer 
+from .mamba_block import Mamba
 
 class DriftRectifier(nn.Module):
     """
@@ -15,9 +15,9 @@ class DriftRectifier(nn.Module):
         
         # 使用两层 Mamba 堆叠，增大感受野以捕捉全局漂移模式
         self.body = nn.Sequential(
-            MambaLayer(d_model),
+            Mamba(d_model),
             nn.LayerNorm(d_model), # 增加 Norm 层提升稳定性
-            MambaLayer(d_model),
+            Mamba(d_model),
             nn.LayerNorm(d_model)
         )
         
